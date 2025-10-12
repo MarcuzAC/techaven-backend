@@ -12,7 +12,7 @@ from app.routes.promotions import router as promotions_router
 from app.routes.admin import router as admin_router
 
 app = FastAPI(
-    title="Tech Haven API",
+    title="Techaven API",
     description="Electronics Marketplace Backend",
     version="1.0.0"
 )
@@ -20,7 +20,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:3000", "https://techaven-admin.vercel.app", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
