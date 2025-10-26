@@ -41,6 +41,7 @@ class UserLogin(BaseModel):
 class UserResponse(UserBase):
     id: str
     created_at: datetime
+    blockchain_tx_id: Optional[str] = None  # Blockchain reference
 
 # Shop Schemas
 class ShopBase(BaseModel):
@@ -59,6 +60,7 @@ class ShopResponse(ShopBase):
     subscription_tier: Optional[SubscriptionTier]
     rating: Optional[float]
     created_at: datetime
+    blockchain_tx_id: Optional[str] = None  # Blockchain reference
 
 # Product Schemas
 class ProductBase(BaseModel):
@@ -78,6 +80,7 @@ class ProductResponse(ProductBase):
     shop_id: str
     images: List[str]
     created_at: datetime
+    blockchain_tx_id: Optional[str] = None  # Blockchain reference
 
 # Order Schemas
 class OrderItemBase(BaseModel):
@@ -97,6 +100,7 @@ class OrderResponse(BaseModel):
     items: List[Dict]
     shipping_address: str
     created_at: datetime
+    blockchain_tx_id: Optional[str] = None  # Blockchain reference
 
 # Promotion Schemas
 class PromotionBase(BaseModel):
@@ -113,3 +117,4 @@ class PromotionResponse(PromotionBase):
     shop_id: str
     product_id: Optional[str]
     status: str
+    blockchain_tx_id: Optional[str] = None  # Blockchain reference

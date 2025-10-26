@@ -3,17 +3,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 
 # Import routers
-from app.auth import router as auth_router
+from app.auth.auth import router as auth_router
 from app.routes.users import router as users_router
 from app.routes.shops import router as shops_router
 from app.routes.products import router as products_router
 from app.routes.orders import router as orders_router
 from app.routes.promotions import router as promotions_router
 from app.routes.admin import router as admin_router
+from app.routes.blockchain import router as blockchain_router  # Add this
+from app.routes.recommendations import router as recommendations_router
 
 app = FastAPI(
     title="Techaven API",
-    description="Electronics Marketplace Backend",
+    description="Electronics Marketplace Backend with Blockchain",
     version="1.0.0"
 )
 
@@ -34,18 +36,27 @@ app.include_router(products_router)
 app.include_router(orders_router)
 app.include_router(promotions_router)
 app.include_router(admin_router)
+app.include_router(blockchain_router)  # Add this line
+app.include_router(recommendations_router)
 
 @app.get("/")
 async def root():
-    return {"message": "Tech Havan API is running 🚀"}
+    return {"message": "Tech Havan API with Blockchain is running 🚀"}
 
 @app.get("/health")
 async def health_check():
     from app.database import test_connection
+    from app.blockchain.service import blockchain_service
+    
     db_status = test_connection()
+    blockchain_status = blockchain_service.is_chain_valid()
+    
     return {
         "status": "healthy",
-        "database": "connected" if db_status else "disconnected"
+        "database": "connected" if db_status else "disconnected",
+        "blockchain": "valid" if blockchain_status else "invalid",
+        "blockchain_blocks": len(blockchain_service.blockchain.chain),
+        "pending_transactions": len(blockchain_service.blockchain.pending_transactions)
     }
 
 if __name__ == "__main__":
