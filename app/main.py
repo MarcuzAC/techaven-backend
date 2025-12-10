@@ -16,7 +16,7 @@ from app.routes.admin_shops import router as admin_shops_router
 
 app = FastAPI(
     title="Techaven API",
-    description="Electronics Marketplace Backend with Blockchain",
+    description="Techaven is an e-commerce platform that leverages blockchain technology to ensure secure and transparent transactions. This API provides endpoints for user management, product listings, order processing, promotions, and blockchain interactions.",
     version="1.0.0"
 )
 

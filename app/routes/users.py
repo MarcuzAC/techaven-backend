@@ -18,12 +18,15 @@ async def get_users(
 ):
     from app.database import supabase
     
-    # Build the query - using your actual model fields
-    query = supabase.table("users").select("id, name, email, type, created_at, blockchain_tx_id", count="exact")
+    # Build the query - updated to include new fields
+    query = supabase.table("users").select(
+        "id, name, email, type, phone_number, profile_picture, created_at, blockchain_tx_id", 
+        count="exact"
+    )
     
     # Apply filters
     if search:
-        query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
+        query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%,phone_number.ilike.%{search}%")
     
     if type:
         query = query.eq("type", type)
@@ -47,6 +50,8 @@ async def get_users(
             "first_name": first_name,
             "last_name": last_name,
             "email": user.get('email'),
+            "phone_number": user.get('phone_number'),
+            "profile_picture": str(user.get('profile_picture')) if user.get('profile_picture') else None,
             "role": user.get('type', 'customer'),  # Map 'type' to 'role' for frontend
             "status": "active",  # Default status since your model doesn't have status
             "created_at": user.get('created_at'),
@@ -87,7 +92,12 @@ async def get_user_profile(current_user: dict = Depends(get_current_user)):
 @router.get("/{user_id}")
 async def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
     from app.database import supabase
-    result = supabase.table("users").select("id, name, email, type, created_at, blockchain_tx_id").eq("id", user_id).execute()
+    
+    # Updated to include phone_number and profile_picture
+    result = supabase.table("users").select(
+        "id, name, email, type, phone_number, profile_picture, created_at, blockchain_tx_id"
+    ).eq("id", user_id).execute()
+    
     if not result.data:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -120,6 +130,8 @@ async def get_user(user_id: str, current_user: dict = Depends(get_current_user))
         "first_name": first_name,
         "last_name": last_name,
         "email": user.get('email'),
+        "phone_number": user.get('phone_number'),
+        "profile_picture": str(user.get('profile_picture')) if user.get('profile_picture') else None,
         "role": user.get('type', 'customer'),
         "status": "active",
         "created_at": user.get('created_at'),
@@ -135,8 +147,11 @@ async def update_user_status(
 ):
     from app.database import supabase
     
-    # Check if user exists
-    user_result = supabase.table("users").select("id, name, email, type").eq("id", user_id).execute()
+    # Check if user exists - updated to include new fields
+    user_result = supabase.table("users").select(
+        "id, name, email, type, phone_number, profile_picture"
+    ).eq("id", user_id).execute()
+    
     if not user_result.data:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -151,6 +166,7 @@ async def update_user_status(
                 "action": "user_status_update",
                 "target_user_id": user_id,
                 "target_user_name": user["name"],
+                "target_user_phone": user.get("phone_number"),
                 "new_status": status,
                 "previous_status": "unknown"  # You might want to track previous status
             },
@@ -166,10 +182,6 @@ async def update_user_status(
         print(f"Blockchain transaction failed: {e}")
         # Continue with the operation even if blockchain recording fails
     
-    # If you add status to your database later, uncomment this:
-    # result = supabase.table("users").update({"status": status}).eq("id", user_id).execute()
-    # return result.data[0]
-    
     return {
         "message": f"User status would be updated to {status}", 
         "user_id": user_id,
@@ -181,7 +193,10 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     from app.database import supabase
     
     # Get user details before deletion for blockchain record
-    user_result = supabase.table("users").select("id, name, email, type").eq("id", user_id).execute()
+    user_result = supabase.table("users").select(
+        "id, name, email, type, phone_number, profile_picture"
+    ).eq("id", user_id).execute()
+    
     if not user_result.data:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -197,6 +212,7 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
                 "deleted_user_id": user_id,
                 "deleted_user_name": user["name"],
                 "deleted_user_email": user["email"],
+                "deleted_user_phone": user.get("phone_number"),
                 "deleted_user_type": user["type"]
             },
             metadata={
@@ -224,7 +240,8 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
         "deleted_user": {
             "id": user_id,
             "name": user["name"],
-            "email": user["email"]
+            "email": user["email"],
+            "phone_number": user.get("phone_number")
         },
         "blockchain_tx_id": delete_transaction.transaction_id if 'delete_transaction' in locals() else None
     }
@@ -240,7 +257,7 @@ async def get_user_blockchain_activity(
     try:
         # Check if user exists
         from app.database import supabase
-        user_result = supabase.table("users").select("id, name").eq("id", user_id).execute()
+        user_result = supabase.table("users").select("id, name, phone_number").eq("id", user_id).execute()
         if not user_result.data:
             raise HTTPException(status_code=404, detail="User not found")
         
@@ -287,6 +304,7 @@ async def get_user_blockchain_activity(
         return {
             "user_id": user_id,
             "user_name": user_result.data[0]["name"],
+            "user_phone": user_result.data[0].get("phone_number"),
             "total_transactions": len(all_transactions),
             "transactions_shown": len(activity),
             "activity": sorted(activity, key=lambda x: x["timestamp"], reverse=True)
@@ -310,7 +328,10 @@ async def update_user_profile(
     from app.database import supabase
     
     # Check if user exists and current user has permission
-    user_result = supabase.table("users").select("id, name, email").eq("id", user_id).execute()
+    user_result = supabase.table("users").select(
+        "id, name, email, phone_number, profile_picture"
+    ).eq("id", user_id).execute()
+    
     if not user_result.data:
         raise HTTPException(status_code=404, detail="User not found")
     
@@ -318,47 +339,62 @@ async def update_user_profile(
     if current_user["id"] != user_id and current_user.get("type") != "admin":
         raise HTTPException(status_code=403, detail="Not authorized to update this profile")
     
-    # Update user profile in database
+    # Validate and prepare update data
     update_data = {}
+    
     if "name" in profile_data:
         update_data["name"] = profile_data["name"]
+    
     if "email" in profile_data:
         update_data["email"] = profile_data["email"]
     
-    if update_data:
-        result = supabase.table("users").update(update_data).eq("id", user_id).execute()
-        
-        # Record profile update on blockchain
-        try:
-            profile_transaction = blockchain_service.create_transaction(
-                transaction_type=TransactionType.USER_REGISTER,  # Using existing type
-                user_id=current_user["id"],
-                data={
-                    "action": "profile_update",
-                    "updated_fields": list(update_data.keys()),
-                    "previous_data": user_result.data[0],
-                    "new_data": update_data
-                },
-                metadata={
-                    "source": "users_route",
-                    "self_update": current_user["id"] == user_id
-                }
-            )
-            
-            blockchain_service.add_transaction(profile_transaction)
-            
-            # Update user with new blockchain transaction reference
-            supabase.table("users").update({
-                "blockchain_tx_id": profile_transaction.transaction_id
-            }).eq("id", user_id).execute()
-            
-        except Exception as e:
-            print(f"Blockchain transaction failed: {e}")
-        
-        return {
-            "message": "Profile updated successfully",
-            "updated_fields": list(update_data.keys()),
-            "blockchain_tx_id": profile_transaction.transaction_id if 'profile_transaction' in locals() else None
-        }
-    else:
+    if "phone_number" in profile_data:
+        update_data["phone_number"] = profile_data["phone_number"]
+    
+    if "profile_picture" in profile_data:
+        update_data["profile_picture"] = profile_data["profile_picture"]
+    
+    if not update_data:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Update user profile in database
+    result = supabase.table("users").update(update_data).eq("id", user_id).execute()
+    
+    if not result.data:
+        raise HTTPException(status_code=400, detail="Failed to update profile")
+    
+    # Record profile update on blockchain
+    try:
+        profile_transaction = blockchain_service.create_transaction(
+            transaction_type=TransactionType.USER_REGISTER,  # Using existing type
+            user_id=current_user["id"],
+            data={
+                "action": "profile_update",
+                "updated_fields": list(update_data.keys()),
+                "previous_data": user_result.data[0],
+                "new_data": update_data
+            },
+            metadata={
+                "source": "users_route",
+                "self_update": current_user["id"] == user_id,
+                "has_profile_picture": "profile_picture" in update_data,
+                "has_phone_update": "phone_number" in update_data
+            }
+        )
+        
+        blockchain_service.add_transaction(profile_transaction)
+        
+        # Update user with new blockchain transaction reference
+        supabase.table("users").update({
+            "blockchain_tx_id": profile_transaction.transaction_id
+        }).eq("id", user_id).execute()
+        
+    except Exception as e:
+        print(f"Blockchain transaction failed: {e}")
+    
+    return {
+        "message": "Profile updated successfully",
+        "updated_fields": list(update_data.keys()),
+        "blockchain_tx_id": profile_transaction.transaction_id if 'profile_transaction' in locals() else None,
+        "user": result.data[0]
+    }

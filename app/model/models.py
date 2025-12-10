@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, HttpUrl
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -30,6 +30,15 @@ class UserBase(BaseModel):
     name: str
     email: EmailStr
     type: UserType
+    phone_number: Optional[str] = Field(
+        None, 
+        pattern=r'^\+?[1-9]\d{1,14}$',  # E.164 format validation
+        description="Phone number in E.164 format (e.g., +1234567890)"
+    )
+    profile_picture: Optional[HttpUrl] = Field(
+        None, 
+        description="URL to the user's profile picture"
+    )
 
 class UserCreate(UserBase):
     password: str = Field(..., min_length=6)
