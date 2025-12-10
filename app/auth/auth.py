@@ -21,14 +21,19 @@ async def signup(user_data: UserCreate):
             detail="Email already registered"
         )
 
-    # Create user
+    # Create user WITH PHONE NUMBER
     hashed_password = get_password_hash(user_data.password)
     new_user = {
         "name": user_data.name,
         "email": user_data.email,
         "password_hash": hashed_password,
-        "type": user_data.type
+        "type": user_data.type,
+        "phone_number": user_data.phone_number,  # ADDED: Phone number field
     }
+    
+    # Optional: Add profile picture if provided
+    if hasattr(user_data, 'profile_picture') and user_data.profile_picture:
+        new_user["profile_picture"] = str(user_data.profile_picture)
     
     result = supabase.table("users").insert(new_user).execute()
     
@@ -49,11 +54,12 @@ async def signup(user_data: UserCreate):
                 "name": user_data.name,
                 "email": user_data.email,
                 "user_type": user_data.type,
+                "has_phone": bool(user_data.phone_number),  # ADDED: Track if phone provided
                 "action": "user_registration"
             },
             metadata={
                 "source": "auth_signup",
-                "user_agent": "web_app"  # You can get this from request headers if needed
+                "user_agent": "web_app"
             }
         )
         
@@ -66,9 +72,7 @@ async def signup(user_data: UserCreate):
         }).eq("id", user_id).execute()
         
     except Exception as e:
-        # Log the error but don't fail the user registration
         print(f"Blockchain transaction failed: {e}")
-        # Continue with user creation even if blockchain fails
     
     # Create shop for merchants and record on blockchain
     if user_data.type == "merchant":
@@ -108,12 +112,11 @@ async def signup(user_data: UserCreate):
                 }).eq("id", shop_id).execute()
                 
         except Exception as e:
-            # Log the error but don't fail the user registration
             print(f"Shop creation blockchain transaction failed: {e}")
     
-    # Auto-mine a block if there are enough pending transactions (optional)
+    # Auto-mine a block if there are enough pending transactions
     try:
-        if len(blockchain_service.blockchain.pending_transactions) >= 5:  # Adjust threshold as needed
+        if len(blockchain_service.blockchain.pending_transactions) >= 5:
             blockchain_service.mine_block()
             print("Auto-mined block due to pending transactions threshold")
     except Exception as e:
@@ -137,10 +140,10 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     
     user = user_result.data[0]
     
-    # Create blockchain transaction for login (optional - for audit trail)
+    # Create blockchain transaction for login
     try:
         login_transaction = blockchain_service.create_transaction(
-            transaction_type=TransactionType.USER_REGISTER,  # Reusing type or create new LOGIN type
+            transaction_type=TransactionType.USER_REGISTER,
             user_id=user["id"],
             data={
                 "action": "user_login",
@@ -149,14 +152,13 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
             },
             metadata={
                 "source": "auth_login",
-                "ip_address": "unknown"  # You can get this from request if needed
+                "ip_address": "unknown"
             }
         )
         
         blockchain_service.add_transaction(login_transaction)
         
     except Exception as e:
-        # Don't fail login if blockchain recording fails
         print(f"Login blockchain transaction failed: {e}")
     
     access_token = create_access_token(
@@ -173,24 +175,20 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: dict = Depends(get_current_user)):
-    # Get user's blockchain transactions for enhanced response
+    # Get user's blockchain transactions
     try:
         user_transactions = blockchain_service.get_transactions_by_user(current_user["id"])
-        # You could include transaction count in response if needed
-        # current_user["blockchain_activity_count"] = len(user_transactions)
     except Exception as e:
         print(f"Failed to get user blockchain transactions: {e}")
     
     return current_user
 
-# Additional blockchain-related auth endpoints
 @router.get("/blockchain/activity")
 async def get_user_blockchain_activity(current_user: dict = Depends(get_current_user)):
     """Get all blockchain transactions for the current user"""
     try:
         transactions = blockchain_service.get_transactions_by_user(current_user["id"])
         
-        # Convert to response format
         activity = []
         for tx in transactions:
             activity.append({
@@ -216,7 +214,6 @@ async def get_user_blockchain_activity(current_user: dict = Depends(get_current_
 @router.post("/blockchain/manual-mine")
 async def manual_mine_block(current_user: dict = Depends(get_current_user)):
     """Manually mine a block (admin or privileged users only)"""
-    # Optional: Add permission check here
     if current_user["type"] not in ["admin", "merchant"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
