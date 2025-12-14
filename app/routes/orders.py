@@ -1,84 +1,167 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
+from datetime import datetime
 from app.database import supabase
-from app.model.models import OrderCreate, OrderResponse, OrderStatus
-from app.dependencies import get_current_user, get_current_merchant, get_current_admin
-
-# Blockchain imports
+from app.dependencies import get_current_user, get_current_merchant
 from app.blockchain.service import blockchain_service
 from app.blockchain.models import TransactionType
-
-import stripe
-from app.config import settings
+from app.model.models import OrderStatus
+import json
+import uuid
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
-@router.post("/", response_model=dict)
-async def create_order(order_data: OrderCreate, current_user: dict = Depends(get_current_user)):
-    # Calculate total and verify product availability
-    total_amount = 0
-    order_items = []
-    products_info = []
+class ShippingAddress(BaseModel):
+    full_name: str
+    phone: str
+    address_line1: str
+    address_line2: Optional[str] = None
+    city: str
+    state: str
+    postal_code: str
+    country: str = "Malawi"
+    is_default: bool = False
+
+class OrderCreate(BaseModel):
+    shipping_address: ShippingAddress
+    shipping_method_id: str
+    payment_method_id: str
+    coupon_code: Optional[str] = None
+    notes: Optional[str] = None
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def create_order(
+    order_data: OrderCreate,
+    current_user: dict = Depends(get_current_user),
+    background_tasks: BackgroundTasks = None
+):
+    """Create order from cart"""
+    # Get user's cart items
+    cart_result = supabase.table("cart_items").select(
+        "*, products(id, title, price, stock, shop_id, shops(name))"
+    ).eq("user_id", current_user["id"]).execute()
     
-    for item in order_data.items:
-        product_result = supabase.table("products").select("*, shops(name)").eq("id", item.product_id).execute()
-        if not product_result.data:
-            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found")
+    if not cart_result.data:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+    
+    # Validate stock and calculate totals
+    order_items = []
+    shop_totals = {}
+    grand_total = 0
+    
+    for cart_item in cart_result.data:
+        product = cart_item["products"]
         
-        product = product_result.data[0]
-        if product["stock"] < item.quantity:
+        # Check stock
+        if product["stock"] < cart_item["quantity"]:
             raise HTTPException(
-                status_code=400, 
-                detail=f"Not enough stock for product {product['title']}"
+                status_code=400,
+                detail=f"Product '{product['title']}' only has {product['stock']} in stock"
             )
         
-        item_total = product["price"] * item.quantity
-        total_amount += item_total
+        item_total = product["price"] * cart_item["quantity"]
+        grand_total += item_total
         
-        order_items.append({
-            "product_id": item.product_id,
-            "quantity": item.quantity,
-            "unit_price": product["price"],
-            "total_price": item_total
-        })
+        # Track shop totals
+        shop_id = product["shop_id"]
+        if shop_id not in shop_totals:
+            shop_totals[shop_id] = {
+                "shop_name": product["shops"]["name"],
+                "total": 0,
+                "items": []
+            }
         
-        products_info.append({
+        shop_totals[shop_id]["total"] += item_total
+        shop_totals[shop_id]["items"].append({
             "product_id": product["id"],
             "title": product["title"],
-            "brand": product["brand"],
+            "quantity": cart_item["quantity"],
             "price": product["price"],
+            "total": item_total
+        })
+        
+        order_items.append({
+            "product_id": product["id"],
+            "product_title": product["title"],
+            "quantity": cart_item["quantity"],
+            "price": product["price"],
+            "total": item_total,
+            "shop_id": shop_id,
             "shop_name": product["shops"]["name"]
         })
     
-    # Get shop_id from first product
-    first_product = supabase.table("products").select("shop_id").eq("id", order_data.items[0].product_id).execute()
-    shop_id = first_product.data[0]["shop_id"]
+    # Get shipping cost
+    shipping_result = supabase.table("shipping_methods").select(
+        "id, name, cost, estimated_days"
+    ).eq("id", order_data.shipping_method_id).execute()
+    
+    if not shipping_result.data:
+        raise HTTPException(status_code=404, detail="Shipping method not found")
+    
+    shipping_method = shipping_result.data[0]
+    shipping_cost = shipping_method["cost"]
+    grand_total += shipping_cost
+    
+    # Apply coupon if provided
+    discount = 0
+    if order_data.coupon_code:
+        coupon_result = supabase.table("coupons").select("*").eq(
+            "code", order_data.coupon_code
+        ).eq("is_active", True).execute()
+        
+        if coupon_result.data:
+            coupon = coupon_result.data[0]
+            # Validate coupon (check expiry, usage limits, etc.)
+            if coupon["expires_at"] and datetime.fromisoformat(coupon["expires_at"]) < datetime.now():
+                raise HTTPException(status_code=400, detail="Coupon has expired")
+            
+            if coupon["max_uses"] and coupon["times_used"] >= coupon["max_uses"]:
+                raise HTTPException(status_code=400, detail="Coupon usage limit reached")
+            
+            # Calculate discount
+            if coupon["discount_type"] == "percentage":
+                discount = grand_total * (coupon["discount_value"] / 100)
+            else:  # fixed amount
+                discount = coupon["discount_value"]
+            
+            grand_total -= discount
     
     # Create order
-    order_data_dict = {
+    order_id = str(uuid.uuid4())
+    
+    order_result = supabase.table("orders").insert({
+        "id": order_id,
         "user_id": current_user["id"],
-        "shop_id": shop_id,
-        "total_amount": total_amount,
-        "status": "pending",
-        "shipping_address": order_data.shipping_address
-    }
+        "total_amount": grand_total,
+        "shipping_cost": shipping_cost,
+        "discount": discount,
+        "status": OrderStatus.PENDING,
+        "shipping_address": order_data.shipping_address.model_dump(),
+        "shipping_method_id": order_data.shipping_method_id,
+        "payment_method_id": order_data.payment_method_id,
+        "coupon_code": order_data.coupon_code,
+        "notes": order_data.notes
+    }).execute()
     
-    order_result = supabase.table("orders").insert(order_data_dict).execute()
-    order_id = order_result.data[0]["id"]
-    
-    # Create order items and update stock
+    # Create order items
     for item in order_items:
-        order_item = {
+        supabase.table("order_items").insert({
             "order_id": order_id,
             "product_id": item["product_id"],
             "quantity": item["quantity"],
-            "unit_price": item["unit_price"]
-        }
-        supabase.table("order_items").insert(order_item).execute()
+            "price": item["price"],
+            "total": item["total"],
+            "shop_id": item["shop_id"]
+        }).execute()
         
         # Update product stock
-        current_stock = supabase.table("products").select("stock").eq("id", item["product_id"]).execute().data[0]["stock"]
-        new_stock = current_stock - item["quantity"]
-        supabase.table("products").update({"stock": new_stock}).eq("id", item["product_id"]).execute()
+        supabase.table("products").update({
+            "stock": supabase.table("products").select("stock").eq("id", item["product_id"]).execute().data[0]["stock"] - item["quantity"]
+        }).eq("id", item["product_id"]).execute()
+    
+    # Clear cart
+    supabase.table("cart_items").delete().eq("user_id", current_user["id"]).execute()
     
     # Record order creation on blockchain
     try:
@@ -87,246 +170,196 @@ async def create_order(order_data: OrderCreate, current_user: dict = Depends(get
             user_id=current_user["id"],
             data={
                 "order_id": order_id,
-                "shop_id": shop_id,
-                "total_amount": total_amount,
-                "items_count": len(order_items),
-                "products": products_info,
-                "shipping_address": order_data.shipping_address,
-                "status": "pending",
+                "total_amount": grand_total,
+                "item_count": len(order_items),
+                "shops_involved": list(shop_totals.keys()),
+                "shipping_method": shipping_method["name"],
                 "action": "order_creation"
             },
-            shop_id=shop_id,
             order_id=order_id,
             metadata={
                 "source": "orders_route",
-                "payment_required": True,
-                "items_count": len(order_items)
+                "has_coupon": bool(order_data.coupon_code),
+                "shop_count": len(shop_totals)
             }
         )
         
         blockchain_tx_id = blockchain_service.add_transaction(order_transaction)
         
-        # Update order with blockchain transaction reference
+        # Update order with blockchain reference
         supabase.table("orders").update({
             "blockchain_tx_id": order_transaction.transaction_id
         }).eq("id", order_id).execute()
         
     except Exception as e:
         print(f"Blockchain transaction failed: {e}")
-        # Continue with order creation even if blockchain fails
+        blockchain_tx_id = None
     
-    # Create Stripe payment intent
-    client_secret = None
-    if settings.STRIPE_SECRET_KEY:
-        stripe.api_key = settings.STRIPE_SECRET_KEY
-        payment_intent = stripe.PaymentIntent.create(
-            amount=int(total_amount * 100),  # Convert to cents
-            currency="usd",
-            metadata={
-                "order_id": order_id,
-                "user_id": current_user["id"],
-                "blockchain_tx_id": order_transaction.transaction_id if 'order_transaction' in locals() else None
-            }
+    # Background task: Send order confirmation email
+    if background_tasks:
+        from app.services.email_service import send_order_confirmation
+        background_tasks.add_task(
+            send_order_confirmation,
+            user_email=current_user["email"],
+            order_id=order_id,
+            order_total=grand_total
         )
-        client_secret = payment_intent.client_secret
     
     return {
-        "order_id": order_id,
-        "total_amount": total_amount,
-        "client_secret": client_secret,
         "message": "Order created successfully",
-        "blockchain_tx_id": order_transaction.transaction_id if 'order_transaction' in locals() else None
+        "order_id": order_id,
+        "total": grand_total,
+        "blockchain_tx_id": blockchain_tx_id
     }
 
-@router.get("/", response_model=list)
-async def get_user_orders(current_user: dict = Depends(get_current_user)):
-    result = supabase.table("orders").select("*, order_items(*, products(*)), shops(name)").eq("user_id", current_user["id"]).execute()
+@router.get("/", response_model=List[Dict[str, Any]])
+async def get_orders(
+    current_user: dict = Depends(get_current_user),
+    status: Optional[OrderStatus] = Query(None),
+    limit: int = Query(20, le=100),
+    offset: int = 0
+):
+    """Get user's orders"""
+    query = supabase.table("orders").select(
+        "*, shipping_methods(name), order_items(count)"
+    ).eq("user_id", current_user["id"])
     
-    # Enhance with blockchain data
-    orders_with_blockchain = []
+    if status:
+        query = query.eq("status", status)
+    
+    result = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+    
+    orders = []
     for order in result.data:
-        try:
-            # Get blockchain transactions for this order
-            order_transactions = []
-            for block in blockchain_service.blockchain.chain:
-                for tx in block.transactions:
-                    if tx.order_id == order["id"]:
-                        order_transactions.append(tx)
-            
-            order["blockchain_activity_count"] = len(order_transactions)
-        except Exception as e:
-            print(f"Failed to get blockchain data for order {order['id']}: {e}")
-            order["blockchain_activity_count"] = 0
-        
-        orders_with_blockchain.append(order)
+        orders.append({
+            "id": order["id"],
+            "total_amount": order["total_amount"],
+            "status": order["status"],
+            "item_count": order["order_items"][0]["count"] if order["order_items"] else 0,
+            "shipping_method": order["shipping_methods"]["name"] if order["shipping_methods"] else None,
+            "created_at": order["created_at"],
+            "blockchain_tx_id": order.get("blockchain_tx_id")
+        })
     
-    return orders_with_blockchain
+    return orders
 
-@router.get("/{order_id}")
-async def get_order(order_id: str, current_user: dict = Depends(get_current_user)):
-    result = supabase.table("orders").select("*, order_items(*, products(*)), shops(name)").eq("id", order_id).execute()
-    if not result.data:
+@router.get("/{order_id}", response_model=Dict[str, Any])
+async def get_order(
+    order_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get order details"""
+    # Get order
+    order_result = supabase.table("orders").select(
+        "*, shipping_methods(name, estimated_days), payment_methods(type, last_four)"
+    ).eq("id", order_id).eq("user_id", current_user["id"]).execute()
+    
+    if not order_result.data:
         raise HTTPException(status_code=404, detail="Order not found")
     
-    order = result.data[0]
-    if order["user_id"] != current_user["id"] and current_user["type"] != "admin":
-        # Check if current user is the shop owner
-        if current_user["type"] == "merchant":
-            shop_result = supabase.table("shops").select("id").eq("user_id", current_user["id"]).execute()
-            if not shop_result.data or shop_result.data[0]["id"] != order["shop_id"]:
-                raise HTTPException(status_code=403, detail="Access denied")
-        else:
-            raise HTTPException(status_code=403, detail="Access denied")
+    order = order_result.data[0]
     
-    # Get order's blockchain transactions for enhanced response
+    # Get order items
+    items_result = supabase.table("order_items").select(
+        "*, products(title, images, shops(name))"
+    ).eq("order_id", order_id).execute()
+    
+    items = []
+    for item in items_result.data:
+        items.append({
+            "product_id": item["product_id"],
+            "title": item["products"]["title"],
+            "images": item["products"]["images"],
+            "quantity": item["quantity"],
+            "price": item["price"],
+            "total": item["total"],
+            "shop_name": item["products"]["shops"]["name"]
+        })
+    
+    # Get shipping tracking if available
+    tracking_result = supabase.table("order_tracking").select("*").eq(
+        "order_id", order_id
+    ).order("created_at", desc=True).limit(1).execute()
+    
+    tracking = tracking_result.data[0] if tracking_result.data else None
+    
+    # Get order blockchain activity
     try:
-        order_transactions = []
-        for block in blockchain_service.blockchain.chain:
-            for tx in block.transactions:
-                if tx.order_id == order_id:
-                    order_transactions.append(tx)
-        
+        order_transactions = blockchain_service.get_transactions_by_order(order_id)
         order["blockchain_activity"] = {
             "total_transactions": len(order_transactions),
-            "activity": [
+            "recent_activity": [
                 {
                     "transaction_type": tx.transaction_type,
                     "timestamp": tx.timestamp,
-                    "user_id": tx.user_id,
                     "data": tx.data
                 }
-                for tx in order_transactions
+                for tx in order_transactions[:5]
             ]
         }
     except Exception as e:
         print(f"Failed to get order blockchain transactions: {e}")
     
-    return order
-
-@router.put("/{order_id}/status")
-async def update_order_status(
-    order_id: str,
-    status: OrderStatus,
-    current_user: dict = Depends(get_current_user)
-):
-    """Update order status (for merchants and admins)"""
-    # Check if order exists
-    order_result = supabase.table("orders").select("*, shops(user_id), users(email, name)").eq("id", order_id).execute()
-    if not order_result.data:
-        raise HTTPException(status_code=404, detail="Order not found")
-    
-    order = order_result.data[0]
-    old_status = order["status"]
-    
-    # Check permissions
-    if current_user["type"] == "merchant":
-        # Check if order belongs to merchant's shop
-        shop_result = supabase.table("shops").select("id").eq("user_id", current_user["id"]).execute()
-        if not shop_result.data or shop_result.data[0]["id"] != order["shop_id"]:
-            raise HTTPException(status_code=403, detail="Access denied")
-    elif current_user["type"] != "admin":
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    if old_status == status:
-        raise HTTPException(status_code=400, detail=f"Order is already {status}")
-    
-    # Update order status
-    result = supabase.table("orders").update({"status": status}).eq("id", order_id).execute()
-    
-    # Record order status update on blockchain
-    try:
-        status_transaction = blockchain_service.create_transaction(
-            transaction_type=TransactionType.ORDER_UPDATE,
-            user_id=current_user["id"],
-            data={
-                "order_id": order_id,
-                "customer_id": order["user_id"],
-                "customer_email": order["users"]["email"],
-                "shop_id": order["shop_id"],
-                "previous_status": old_status,
-                "new_status": status,
-                "total_amount": order["total_amount"],
-                "action": "order_status_update"
-            },
-            shop_id=order["shop_id"],
-            order_id=order_id,
-            metadata={
-                "source": "orders_route_status",
-                "updated_by": "merchant" if current_user["type"] == "merchant" else "admin",
-                "status_change": f"{old_status}->{status}"
-            }
-        )
-        
-        blockchain_service.add_transaction(status_transaction)
-        
-        # Update order with new blockchain transaction reference
-        supabase.table("orders").update({
-            "blockchain_tx_id": status_transaction.transaction_id
-        }).eq("id", order_id).execute()
-        
-    except Exception as e:
-        print(f"Blockchain transaction failed: {e}")
-    
     return {
-        "message": f"Order status updated to {status}",
-        "order_id": order_id,
-        "previous_status": old_status,
-        "new_status": status,
-        "blockchain_tx_id": status_transaction.transaction_id if 'status_transaction' in locals() else None
+        **order,
+        "items": items,
+        "tracking": tracking,
+        "shipping_address": json.loads(order["shipping_address"]) if isinstance(order["shipping_address"], str) else order["shipping_address"]
     }
 
-@router.post("/{order_id}/cancel")
+@router.put("/{order_id}/cancel")
 async def cancel_order(
     order_id: str,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    background_tasks: BackgroundTasks = None
 ):
-    """Cancel an order (for customers and admins)"""
-    # Check if order exists
-    order_result = supabase.table("orders").select("*, order_items(*, products(*))").eq("id", order_id).execute()
+    """Cancel an order"""
+    # Get order
+    order_result = supabase.table("orders").select("*").eq(
+        "id", order_id
+    ).eq("user_id", current_user["id"]).execute()
+    
     if not order_result.data:
         raise HTTPException(status_code=404, detail="Order not found")
     
     order = order_result.data[0]
     
-    # Check permissions
-    if current_user["type"] == "customer" and order["user_id"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Access denied")
+    # Check if order can be cancelled
+    if order["status"] not in [OrderStatus.PENDING, OrderStatus.CONFIRMED]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel order with status: {order['status']}"
+        )
     
-    if order["status"] in ["delivered", "cancelled"]:
-        raise HTTPException(status_code=400, detail=f"Cannot cancel order with status: {order['status']}")
+    # Update order status
+    supabase.table("orders").update({
+        "status": OrderStatus.CANCELLED,
+        "cancelled_at": datetime.now().isoformat()
+    }).eq("id", order_id).execute()
     
-    old_status = order["status"]
+    # Restock products
+    items_result = supabase.table("order_items").select("*").eq("order_id", order_id).execute()
+    for item in items_result.data:
+        supabase.table("products").update({
+            "stock": supabase.table("products").select("stock").eq("id", item["product_id"]).execute().data[0]["stock"] + item["quantity"]
+        }).eq("id", item["product_id"]).execute()
     
-    # Update order status to cancelled
-    result = supabase.table("orders").update({"status": "cancelled"}).eq("id", order_id).execute()
-    
-    # Restore product stock
-    for item in order["order_items"]:
-        product = item["products"]
-        current_stock = product["stock"]
-        new_stock = current_stock + item["quantity"]
-        supabase.table("products").update({"stock": new_stock}).eq("id", product["id"]).execute()
-    
-    # Record order cancellation on blockchain
+    # Record cancellation on blockchain
     try:
         cancel_transaction = blockchain_service.create_transaction(
             transaction_type=TransactionType.ORDER_CANCEL,
             user_id=current_user["id"],
             data={
                 "order_id": order_id,
-                "shop_id": order["shop_id"],
-                "previous_status": old_status,
-                "new_status": "cancelled",
+                "previous_status": order["status"],
                 "total_amount": order["total_amount"],
-                "items_restocked": len(order["order_items"]),
                 "action": "order_cancellation"
             },
-            shop_id=order["shop_id"],
             order_id=order_id,
             metadata={
-                "source": "orders_route_cancel",
-                "cancelled_by": "customer" if current_user["type"] == "customer" else "admin",
-                "stock_restored": True
+                "source": "orders_route",
+                "items_restocked": len(items_result.data),
+                "user_initiated": True
             }
         )
         
@@ -335,121 +368,119 @@ async def cancel_order(
     except Exception as e:
         print(f"Blockchain transaction failed: {e}")
     
-    return {
-        "message": "Order cancelled successfully",
-        "order_id": order_id,
-        "stock_restored": True,
-        "blockchain_tx_id": cancel_transaction.transaction_id if 'cancel_transaction' in locals() else None
-    }
+    # Background task: Send cancellation email
+    if background_tasks:
+        from app.services.email_service import send_order_cancellation
+        background_tasks.add_task(
+            send_order_cancellation,
+            user_email=current_user["email"],
+            order_id=order_id
+        )
+    
+    return {"message": "Order cancelled successfully"}
 
-@router.get("/shop/orders")
-async def get_shop_orders(current_user: dict = Depends(get_current_merchant)):
-    """Get all orders for merchant's shop"""
-    # Get merchant's shop
-    shop_result = supabase.table("shops").select("id").eq("user_id", current_user["id"]).execute()
-    if not shop_result.data:
-        raise HTTPException(status_code=404, detail="Shop not found")
-    
-    shop_id = shop_result.data[0]["id"]
-    
-    result = supabase.table("orders").select("*, order_items(*, products(*)), users(name, email)").eq("shop_id", shop_id).execute()
-    
-    # Enhance with blockchain data
-    orders_with_blockchain = []
-    for order in result.data:
-        try:
-            # Get blockchain transactions for this order
-            order_transactions = []
-            for block in blockchain_service.blockchain.chain:
-                for tx in block.transactions:
-                    if tx.order_id == order["id"]:
-                        order_transactions.append(tx)
-            
-            order["blockchain_activity_count"] = len(order_transactions)
-        except Exception as e:
-            print(f"Failed to get blockchain data for order {order['id']}: {e}")
-            order["blockchain_activity_count"] = 0
-        
-        orders_with_blockchain.append(order)
-    
-    return orders_with_blockchain
-
-@router.get("/{order_id}/blockchain-activity")
-async def get_order_blockchain_activity(
+@router.get("/{order_id}/tracking")
+async def get_order_tracking(
     order_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get detailed blockchain activity for a specific order"""
-    try:
-        # Check if order exists and user has access
-        order_result = supabase.table("orders").select("*, shops(name), users(name, email)").eq("id", order_id).execute()
-        if not order_result.data:
-            raise HTTPException(status_code=404, detail="Order not found")
-        
-        order = order_result.data[0]
-        
-        # Check access rights
-        if (current_user["type"] == "customer" and order["user_id"] != current_user["id"]) and \
-           (current_user["type"] == "merchant" and order["shop_id"] != supabase.table("shops").select("id").eq("user_id", current_user["id"]).execute().data[0]["id"]) and \
-           current_user["type"] != "admin":
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        # Get all transactions for this order
-        all_transactions = []
-        for block in blockchain_service.blockchain.chain:
-            for tx in block.transactions:
-                if tx.order_id == order_id:
-                    all_transactions.append(tx)
-        
-        # Also check pending transactions
-        for tx in blockchain_service.blockchain.pending_transactions:
-            if tx.order_id == order_id:
-                all_transactions.append(tx)
-        
-        # Format response
-        activity = []
-        for tx in all_transactions:
-            # Determine if transaction is confirmed (in a block)
-            confirmed = any(
-                tx in block.transactions 
-                for block in blockchain_service.blockchain.chain
-            )
-            
-            # Find block index if confirmed
-            block_index = None
-            if confirmed:
-                for i, block in enumerate(blockchain_service.blockchain.chain):
-                    if tx in block.transactions:
-                        block_index = i
-                        break
-            
-            activity.append({
-                "transaction_id": tx.transaction_id,
-                "transaction_type": tx.transaction_type.value,
-                "user_id": tx.user_id,
-                "timestamp": tx.timestamp,
-                "data": tx.data,
-                "metadata": tx.metadata,
-                "confirmed": confirmed,
-                "block_index": block_index,
-                "shop_id": tx.shop_id,
-                "product_id": tx.product_id
-            })
-        
-        return {
-            "order_id": order_id,
-            "customer_name": order["users"]["name"],
-            "shop_name": order["shops"]["name"],
-            "total_amount": order["total_amount"],
-            "current_status": order["status"],
-            "total_activities": len(activity),
-            "activity": sorted(activity, key=lambda x: x["timestamp"], reverse=True)
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
+    """Get order tracking information"""
+    # Verify order belongs to user
+    order_result = supabase.table("orders").select("id").eq(
+        "id", order_id
+    ).eq("user_id", current_user["id"]).execute()
+    
+    if not order_result.data:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Get tracking info
+    tracking_result = supabase.table("order_tracking").select("*").eq(
+        "order_id", order_id
+    ).order("created_at").execute()
+    
+    return {
+        "order_id": order_id,
+        "tracking": tracking_result.data
+    }
+
+@router.post("/{order_id}/return")
+async def request_return(
+    order_id: str,
+    reason: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Request return for an order"""
+    # Get order
+    order_result = supabase.table("orders").select("*").eq(
+        "id", order_id
+    ).eq("user_id", current_user["id"]).execute()
+    
+    if not order_result.data:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    order = order_result.data[0]
+    
+    # Check if order can be returned
+    if order["status"] != OrderStatus.DELIVERED:
         raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to retrieve blockchain activity: {str(e)}"
+            status_code=400,
+            detail="Only delivered orders can be returned"
         )
+    
+    # Check if return already requested
+    existing_return = supabase.table("order_returns").select("*").eq(
+        "order_id", order_id
+    ).execute()
+    
+    if existing_return.data:
+        raise HTTPException(status_code=400, detail="Return already requested for this order")
+    
+    # Create return request
+    return_id = str(uuid.uuid4())
+    supabase.table("order_returns").insert({
+        "id": return_id,
+        "order_id": order_id,
+        "user_id": current_user["id"],
+        "reason": reason,
+        "status": "pending",
+        "requested_at": datetime.now().isoformat()
+    }).execute()
+    
+    return {
+        "message": "Return request submitted successfully",
+        "return_id": return_id,
+        "status": "pending"
+    }
+
+@router.get("/stats")
+async def get_order_stats(current_user: dict = Depends(get_current_user)):
+    """Get user order statistics"""
+    # Get total orders
+    total_result = supabase.table("orders").select(
+        "count", count="exact"
+    ).eq("user_id", current_user["id"]).execute()
+    
+    # Get orders by status
+    status_result = supabase.table("orders").select(
+        "status, count(*)"
+    ).eq("user_id", current_user["id"]).group("status").execute()
+    
+    # Get total spent
+    spent_result = supabase.table("orders").select(
+        "sum(total_amount)"
+    ).eq("user_id", current_user["id"]).eq("status", OrderStatus.DELIVERED).execute()
+    
+    status_counts = {}
+    for item in status_result.data:
+        status_counts[item["status"]] = item["count"]
+    
+    return {
+        "total_orders": total_result.count or 0,
+        "status_counts": status_counts,
+        "total_spent": spent_result.data[0]["sum"] if spent_result.data and spent_result.data[0]["sum"] else 0,
+        "average_order_value": (
+            spent_result.data[0]["sum"] / total_result.count 
+            if total_result.count and total_result.count > 0 and spent_result.data and spent_result.data[0]["sum"]
+            else 0
+        )
+    }

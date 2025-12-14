@@ -13,6 +13,13 @@ from app.routes.admin import router as admin_router
 from app.routes.blockchain import router as blockchain_router  # Add this
 from app.routes.recommendations import router as recommendations_router
 from app.routes.admin_shops import router as admin_shops_router
+from app.routes.categories import router as categories_router
+from app.routes.reviews import router as reviews_router
+from app.routes.cart import router as cart_router
+from app.routes.favourites import router as favourites_router
+from app.routes.notifications import router as notifications_router
+from app.routes.recentlyviewed import router as recentlyviewed_router
+from app.routes.reviews import router as reviews_router
 
 app = FastAPI(
     title="Techaven API",
@@ -40,6 +47,13 @@ app.include_router(admin_router)
 app.include_router(blockchain_router)  # Add this line
 app.include_router(recommendations_router)
 app.include_router(admin_shops_router)
+app.include_router(categories_router)
+app.include_router(reviews_router)
+app.include_router(cart_router)
+app.include_router(favourites_router)
+app.include_router(notifications_router)
+app.include_router(recentlyviewed_router)
+app.include_router(reviews_router)
 
 @app.get("/")
 async def root():
