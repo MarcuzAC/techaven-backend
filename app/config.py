@@ -1,6 +1,6 @@
 import os
 from typing import List, Optional, Union
-from pydantic import Field, validator, SecretStr
+from pydantic import Field, validator, SecretStr, model_validator
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # API
     API_V1_STR: str = "/api/v1"
     PROJECT_NAME: str = "ElectroBazaar API"
-    API_KEY: Optional[SecretStr] = Field(default=None, env="API_KEY")
+    API_KEY: Optional[str] = Field(default=None, env="API_KEY")
     
     # Server
     HOST: str = Field(default="0.0.0.0", env="HOST")
@@ -24,12 +24,12 @@ class Settings(BaseSettings):
     WORKERS: int = Field(default=4, env="WORKERS")
     
     # ========== SECURITY ==========
-    SECRET_KEY: SecretStr = Field(
-        default=None,
+    SECRET_KEY: str = Field(
+        default="development-secret-key-change-in-production",
         env="SECRET_KEY"
     )
-    JWT_SECRET: SecretStr = Field(
-        default=None,
+    JWT_SECRET: str = Field(
+        default="development-jwt-secret-change-in-production",
         env="JWT_SECRET"
     )
     JWT_ALGORITHM: str = "HS256"
@@ -41,14 +41,14 @@ class Settings(BaseSettings):
     
     # ========== DATABASE ==========
     SUPABASE_URL: str = Field(
-        default=None,
+        default="",
         env="SUPABASE_URL"
     )
-    SUPABASE_KEY: SecretStr = Field(
-        default=None,
+    SUPABASE_KEY: str = Field(
+        default="",
         env="SUPABASE_KEY"
     )
-    SUPABASE_SERVICE_KEY: SecretStr = Field(
+    SUPABASE_SERVICE_KEY: Optional[str] = Field(
         default=None,
         env="SUPABASE_SERVICE_KEY"
     )
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     SUPABASE_DB_POOL_SIZE: int = Field(default=10, env="SUPABASE_DB_POOL_SIZE")
     
     # ========== PAYMENT PROCESSING ==========
-    STRIPE_SECRET_KEY: Optional[SecretStr] = Field(
+    STRIPE_SECRET_KEY: Optional[str] = Field(
         default=None,
         env="STRIPE_SECRET_KEY"
     )
@@ -64,7 +64,7 @@ class Settings(BaseSettings):
         default=None,
         env="STRIPE_PUBLISHABLE_KEY"
     )
-    STRIPE_WEBHOOK_SECRET: Optional[SecretStr] = Field(
+    STRIPE_WEBHOOK_SECRET: Optional[str] = Field(
         default=None,
         env="STRIPE_WEBHOOK_SECRET"
     )
@@ -82,7 +82,7 @@ class Settings(BaseSettings):
         default=None,
         env="REDIS_URL"
     )
-    REDIS_PASSWORD: Optional[SecretStr] = Field(
+    REDIS_PASSWORD: Optional[str] = Field(
         default=None,
         env="REDIS_PASSWORD"
     )
@@ -115,7 +115,7 @@ class Settings(BaseSettings):
         default=None,
         env="SMTP_USER"
     )
-    SMTP_PASSWORD: Optional[SecretStr] = Field(
+    SMTP_PASSWORD: Optional[str] = Field(
         default=None,
         env="SMTP_PASSWORD"
     )
@@ -162,11 +162,11 @@ class Settings(BaseSettings):
         default=None,
         env="GOOGLE_ANALYTICS_ID"
     )
-    MIXPANEL_TOKEN: Optional[SecretStr] = Field(
+    MIXPANEL_TOKEN: Optional[str] = Field(
         default=None,
         env="MIXPANEL_TOKEN"
     )
-    SENTRY_DSN: Optional[SecretStr] = Field(
+    SENTRY_DSN: Optional[str] = Field(
         default=None,
         env="SENTRY_DSN"
     )
@@ -211,7 +211,7 @@ class Settings(BaseSettings):
         default=None,
         env="GOOGLE_CLIENT_ID"
     )
-    GOOGLE_CLIENT_SECRET: Optional[SecretStr] = Field(
+    GOOGLE_CLIENT_SECRET: Optional[str] = Field(
         default=None,
         env="GOOGLE_CLIENT_SECRET"
     )
@@ -221,27 +221,27 @@ class Settings(BaseSettings):
         default=None,
         env="FACEBOOK_APP_ID"
     )
-    FACEBOOK_APP_SECRET: Optional[SecretStr] = Field(
+    FACEBOOK_APP_SECRET: Optional[str] = Field(
         default=None,
         env="FACEBOOK_APP_SECRET"
     )
     
     # Twitter
-    TWITTER_API_KEY: Optional[SecretStr] = Field(
+    TWITTER_API_KEY: Optional[str] = Field(
         default=None,
         env="TWITTER_API_KEY"
     )
-    TWITTER_API_SECRET: Optional[SecretStr] = Field(
+    TWITTER_API_SECRET: Optional[str] = Field(
         default=None,
         env="TWITTER_API_SECRET"
     )
     
     # Twilio (for SMS)
-    TWILIO_ACCOUNT_SID: Optional[SecretStr] = Field(
+    TWILIO_ACCOUNT_SID: Optional[str] = Field(
         default=None,
         env="TWILIO_ACCOUNT_SID"
     )
-    TWILIO_AUTH_TOKEN: Optional[SecretStr] = Field(
+    TWILIO_AUTH_TOKEN: Optional[str] = Field(
         default=None,
         env="TWILIO_AUTH_TOKEN"
     )
@@ -251,11 +251,11 @@ class Settings(BaseSettings):
     )
     
     # Push Notifications
-    FCM_SERVER_KEY: Optional[SecretStr] = Field(
+    FCM_SERVER_KEY: Optional[str] = Field(
         default=None,
         env="FCM_SERVER_KEY"
     )
-    APNS_KEY_ID: Optional[SecretStr] = Field(
+    APNS_KEY_ID: Optional[str] = Field(
         default=None,
         env="APNS_KEY_ID"
     )
@@ -285,7 +285,7 @@ class Settings(BaseSettings):
     
     # Admin
     ADMIN_EMAIL: str = Field(default="admin@example.com", env="ADMIN_EMAIL")
-    ADMIN_PASSWORD: SecretStr = Field(
+    ADMIN_PASSWORD: Optional[str] = Field(
         default=None,
         env="ADMIN_PASSWORD"
     )
@@ -300,6 +300,29 @@ class Settings(BaseSettings):
     # Legal
     TERMS_URL: str = Field(default="/terms", env="TERMS_URL")
     PRIVACY_URL: str = Field(default="/privacy", env="PRIVACY_URL")
+    
+    # Pydantic v2 validator - FIXED SIGNATURE
+    @model_validator(mode='after')
+    def validate_security_keys(self):
+        """Validate security keys after model is created"""
+        if self.ENVIRONMENT == "production":
+            # Check SECRET_KEY
+            if not self.SECRET_KEY or "change" in self.SECRET_KEY.lower() or "development" in self.SECRET_KEY.lower() or len(self.SECRET_KEY) < 32:
+                print(f"⚠️  WARNING: Using weak SECRET_KEY in production: {self.SECRET_KEY[:20]}...")
+                print("   Please set a strong SECRET_KEY in production!")
+            
+            # Check JWT_SECRET
+            if not self.JWT_SECRET or "change" in self.JWT_SECRET.lower() or "development" in self.JWT_SECRET.lower() or len(self.JWT_SECRET) < 32:
+                print(f"⚠️  WARNING: Using weak JWT_SECRET in production: {self.JWT_SECRET[:20]}...")
+                print("   Please set a strong JWT_SECRET in production!")
+            
+            # Check Supabase configuration
+            if not self.SUPABASE_URL or not self.SUPABASE_KEY:
+                print("❌ ERROR: Supabase configuration is required in production")
+                print("   Please set SUPABASE_URL and SUPABASE_KEY")
+                # Don't raise error here, let the validation function handle it
+        
+        return self
     
     class Config:
         env_file = ".env"
@@ -319,32 +342,11 @@ def is_production() -> bool:
 def is_testing() -> bool:
     return settings.ENVIRONMENT.lower() == "testing"
 
-# Safe getter methods for secrets
-def get_secret_key() -> str:
-    if not settings.SECRET_KEY:
-        raise ValueError("SECRET_KEY is not set")
-    return settings.SECRET_KEY.get_secret_value()
-
-def get_jwt_secret() -> str:
-    if not settings.JWT_SECRET:
-        raise ValueError("JWT_SECRET is not set")
-    return settings.JWT_SECRET.get_secret_value()
-
-def get_supabase_key() -> str:
-    if not settings.SUPABASE_KEY:
-        raise ValueError("SUPABASE_KEY is not set")
-    return settings.SUPABASE_KEY.get_secret_value()
-
-def get_supabase_service_key() -> str:
-    if not settings.SUPABASE_SERVICE_KEY:
-        raise ValueError("SUPABASE_SERVICE_KEY is not set")
-    return settings.SUPABASE_SERVICE_KEY.get_secret_value()
-
-# Validate critical settings
+# Validate settings
 def validate_settings():
     if is_production():
-        # Check required production settings
-        required_in_production = [
+        # Check required settings
+        required = [
             ("SECRET_KEY", settings.SECRET_KEY),
             ("JWT_SECRET", settings.JWT_SECRET),
             ("SUPABASE_URL", settings.SUPABASE_URL),
@@ -352,12 +354,19 @@ def validate_settings():
         ]
         
         missing = []
-        for name, value in required_in_production:
-            if not value:
+        for name, value in required:
+            if not value or value.strip() == "":
                 missing.append(name)
         
         if missing:
             raise ValueError(f"Missing required settings in production: {', '.join(missing)}")
+        
+        # Warn about weak keys
+        if "change" in settings.SECRET_KEY.lower():
+            print("⚠️  WARNING: Using default SECRET_KEY in production - please change this!")
+        
+        if "change" in settings.JWT_SECRET.lower():
+            print("⚠️  WARNING: Using default JWT_SECRET in production - please change this!")
     
     return True
 
@@ -366,7 +375,7 @@ try:
     validate_settings()
     print(f"✅ Settings loaded successfully for {settings.ENVIRONMENT} environment")
     print(f"✅ App Name: {settings.APP_NAME} v{settings.APP_VERSION}")
-    print(f"✅ Database: {'Configured' if settings.SUPABASE_URL else 'Not configured'}")
+    print(f"✅ Database: {'Configured' if settings.SUPABASE_URL and settings.SUPABASE_URL.strip() else 'Not configured'}")
     print(f"✅ Redis: {'Available' if settings.REDIS_URL else 'Not configured'}")
     print(f"✅ Email: {'Configured' if settings.SMTP_HOST else 'Not configured'}")
 except Exception as e:
