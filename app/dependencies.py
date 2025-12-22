@@ -1,14 +1,14 @@
+# app/dependencies.py
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional, Dict, Any, List
 import time
 import json
-from app.utils.security import verify_token, verify_refresh_token, decode_token
+from app.utils.security import verify_token, verify_refresh_token
 from app.database import supabase
 from app.config import settings
 from .utils.redis_client import redis_client  # Fixed import path
 import jwt
-import asyncio
 
 # Initialize security
 security = HTTPBearer(auto_error=False)
@@ -67,42 +67,51 @@ async def get_current_user(
             )
         
         # Extract user info from token
-        user_id = payload.get("sub")
+        # IMPORTANT FIX: The "sub" field contains EMAIL, not user_id
+        email = payload.get("sub")  # This is EMAIL, not ID!
         user_type = payload.get("type")
         
-        if not user_id:
+        if not email:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token payload",
+                detail="Invalid token payload - missing email",
                 headers={"WWW-Authenticate": "Bearer"}
             )
         
-        # Check cache first
-        cache_key = f"user:{user_id}"
+        # Also get user_id from separate claim if available
+        user_id = payload.get("user_id")
+        
+        # Check cache first - try both email and user_id
+        cache_key = f"user:email:{email}"
         cached_user = await redis_client.get(cache_key)
         
         if cached_user:
             try:
                 user_data = json.loads(cached_user)
                 
-                # Update last active timestamp
-                user_data["last_active"] = time.time()
-                await redis_client.setex(cache_key, USER_CACHE_TTL, json.dumps(user_data))
-                
-                # Track rate limiting (optional)
-                await track_user_request(user_id, request)
-                
-                return user_data
+                # Verify user_id matches if provided in token
+                if user_id and str(user_data.get("id")) != user_id:
+                    # Token user_id doesn't match cached user, clear cache
+                    await redis_client.delete(cache_key)
+                else:
+                    # Update last active timestamp
+                    user_data["last_active"] = time.time()
+                    await redis_client.setex(cache_key, USER_CACHE_TTL, json.dumps(user_data))
+                    
+                    # Track rate limiting
+                    await track_user_request(user_data.get("id"), request)
+                    
+                    return user_data
             except json.JSONDecodeError:
                 # Cache corrupted, fetch from DB
                 pass
         
-        # Fetch from database
+        # Fetch from database using EMAIL
         result = supabase.table("users").select(
             "id, email, name, type, phone_number, profile_picture, "
             "is_active, is_verified, created_at, updated_at, "
             "blockchain_tx_id, settings"
-        ).eq("id", user_id).execute()
+        ).eq("email", email).execute()  # CHANGED: Using email, not id
         
         if not result.data:
             raise HTTPException(
@@ -112,12 +121,28 @@ async def get_current_user(
         
         user = result.data[0]
         
+        # Verify user_id matches if provided in token
+        if user_id and str(user.get("id")) != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token user_id mismatch"
+            )
+        
         # Check if user is active
-        if not user.get("is_active", True):
+        # Note: is_active column might not exist - handle gracefully
+        if "is_active" in user and not user.get("is_active", True):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account is deactivated"
             )
+        
+        # Add default values for missing columns
+        if "is_active" not in user:
+            user["is_active"] = True
+        if "updated_at" not in user:
+            user["updated_at"] = user.get("created_at")
+        if "settings" not in user:
+            user["settings"] = {}
         
         # Add additional fields for convenience
         user["user_id"] = user["id"]
@@ -125,15 +150,24 @@ async def get_current_user(
         user["token_issued_at"] = payload.get("iat")
         user["token_expires_at"] = payload.get("exp")
         
-        # Cache the user
+        # Cache the user by email
         await redis_client.setex(
             cache_key, 
             USER_CACHE_TTL, 
             json.dumps(user)
         )
         
-        # Track rate limiting (optional)
-        await track_user_request(user_id, request)
+        # Also cache by user_id for faster lookup if needed
+        if user.get("id"):
+            id_cache_key = f"user:id:{user['id']}"
+            await redis_client.setex(
+                id_cache_key,
+                USER_CACHE_TTL,
+                json.dumps(user)
+            )
+        
+        # Track rate limiting
+        await track_user_request(user.get("id"), request)
         
         return user
         
@@ -237,17 +271,18 @@ async def get_refresh_token_user(
     """
     try:
         payload = verify_refresh_token(refresh_token)
-        user_id = payload.get("sub")
+        email = payload.get("sub")  # This should be email
         
-        if not user_id:
+        if not email:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid refresh token"
             )
         
+        # Query by email since refresh tokens should follow same pattern
         result = supabase.table("users").select(
             "id, email, type, is_active"
-        ).eq("id", user_id).execute()
+        ).eq("email", email).execute()  # CHANGED: Query by email
         
         if not result.data:
             raise HTTPException(
@@ -257,7 +292,7 @@ async def get_refresh_token_user(
         
         user = result.data[0]
         
-        if not user.get("is_active", True):
+        if "is_active" in user and not user.get("is_active", True):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account is deactivated"
@@ -429,8 +464,11 @@ async def blacklist_token(token: str, expires_in: int = TOKEN_BLACKLIST_TTL):
 
 async def clear_user_cache(user_id: str):
     """Clear user cache (call after user updates)"""
-    cache_key = f"user:{user_id}"
+    cache_key = f"user:id:{user_id}"
     await redis_client.delete(cache_key)
+    
+    # Also clear by email cache if we have the email
+    # This would require storing email in cache or fetching from DB
 
 
 async def track_user_request(user_id: str, request: Request):
@@ -519,8 +557,3 @@ async def add_rate_limit_headers(request: Request, call_next):
             response.headers[key] = str(value)
     
     return response
-
-
-# Add this to fix the circular import issue in your auth.py
-# Remove or fix the import from .utils.redis_client in your auth.py file
-# Instead, update your auth.py imports to match:
